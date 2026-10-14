@@ -13,8 +13,11 @@ env:
 jobs:
   publish:
     name: Publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-2404-2core
     steps:
+      # ---------------------------------------------------------------
+      # 1. Environment setup
+      # ---------------------------------------------------------------
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet
@@ -34,30 +37,106 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # ---------- Build binaries for BOTH architectures ----------
-      # The Dockerfiles do: COPY $TARGETPLATFORM/<binary> /usr/bin/<binary>
-      # TARGETPLATFORM is "linux/amd64" or "linux/arm64",
-      # so the context must have ./linux/amd64/... and ./linux/arm64/...
-      - name: Build kubescape + ksserver + downloader (amd64)
+      # ---------------------------------------------------------------
+      # 2. Discover the correct package paths (prints to log)
+      # ---------------------------------------------------------------
+      - name: Discover repo layout
+        run: |
+          echo "===== Top-level ====="
+          ls -la
+          echo
+          echo "===== cmd/ tree (2 levels) ====="
+          find cmd -maxdepth 2 -type d 2>/dev/null || echo "no cmd/ dir"
+          echo
+          echo "===== All main.go files ====="
+          find . -name main.go -not -path './vendor/*' -not -path './.git/*'
+          echo
+          echo "===== Go main packages ====="
+          go list -f '{{.ImportPath}} [{{.Name}}]' ./... 2>/dev/null | grep '\[main\]' || true
+          echo
+          echo "===== Files named like our targets ====="
+          find . -type f \( -name 'kubescape*' -o -name 'ksserver*' -o -name 'downloader*' \) \
+            -not -path './vendor/*' -not -path './.git/*' 2>/dev/null || true
+
+      # ---------------------------------------------------------------
+      # 3. Auto-resolve the three package paths into env vars
+      #    (falls back gracefully if a package isn't found)
+      # ---------------------------------------------------------------
+      - name: Resolve build targets
+        id: resolve
+        run: |
+          find_pkg () {
+            local name="$1"
+            local hit
+            # 1) Directory named $name containing main.go
+            hit=$(find . -type d -name "$name" -not -path './vendor/*' \
+                  -exec test -f '{}/main.go' \; -print 2>/dev/null | head -n1)
+            if [ -n "$hit" ]; then
+              echo "./${hit#./}"
+              return
+            fi
+            # 2) Any main package whose import path ends with /$name
+            go list -f '{{.ImportPath}} {{.Name}}' ./... 2>/dev/null \
+              | awk -v n="$name" '$2=="main" && $1 ~ ("/"n"$") {print $1; exit}'
+          }
+
+          KS=$(find_pkg kubescape)
+          KSS=$(find_pkg ksserver)
+          DL=$(find_pkg downloader)
+
+          echo "kubescape  -> [$KS]"
+          echo "ksserver   -> [$KSS]"
+          echo "downloader -> [$DL]"
+
+          # Fail fast with a helpful message if any are missing
+          missing=""
+          [ -z "$KS" ]  && missing="$missing kubescape"
+          [ -z "$KSS" ] && missing="$missing ksserver"
+          [ -z "$DL" ]  && missing="$missing downloader"
+          if [ -n "$missing" ]; then
+            echo "::error::Could not locate main packages for:$missing"
+            echo "See 'Discover repo layout' output above and set paths manually."
+            exit 1
+          fi
+
+          {
+            echo "KUBESCAPE_PKG=$KS"
+            echo "KSSERVER_PKG=$KSS"
+            echo "DOWNLOADER_PKG=$DL"
+          } >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # 4. Cross-compile binaries for both target platforms.
+      #    Dockerfiles do: COPY $TARGETPLATFORM/<bin> ...
+      #    so we must produce ./linux/amd64/<bin> and ./linux/arm64/<bin>
+      # ---------------------------------------------------------------
+      - name: Build binaries (linux/amd64)
         env:
           GOOS: linux
           GOARCH: amd64
+          CGO_ENABLED: "0"
         run: |
           mkdir -p linux/amd64
-          go build -o linux/amd64/kubescape       ./cmd/kubescape
-          go build -o linux/amd64/ksserver        ./cmd/ksserver
-          go build -o linux/amd64/downloader      ./cmd/downloader
+          go build -trimpath -ldflags "-s -w" -o linux/amd64/kubescape  "$KUBESCAPE_PKG"
+          go build -trimpath -ldflags "-s -w" -o linux/amd64/ksserver   "$KSSERVER_PKG"
+          go build -trimpath -ldflags "-s -w" -o linux/amd64/downloader "$DOWNLOADER_PKG"
+          ls -lh linux/amd64
 
-      - name: Build kubescape + ksserver + downloader (arm64)
+      - name: Build binaries (linux/arm64)
         env:
           GOOS: linux
           GOARCH: arm64
+          CGO_ENABLED: "0"
         run: |
           mkdir -p linux/arm64
-          go build -o linux/arm64/kubescape       ./cmd/kubescape
-          go build -o linux/arm64/ksserver        ./cmd/ksserver
-          go build -o linux/arm64/downloader      ./cmd/downloader
+          go build -trimpath -ldflags "-s -w" -o linux/arm64/kubescape  "$KUBESCAPE_PKG"
+          go build -trimpath -ldflags "-s -w" -o linux/arm64/ksserver   "$KSSERVER_PKG"
+          go build -trimpath -ldflags "-s -w" -o linux/arm64/downloader "$DOWNLOADER_PKG"
+          ls -lh linux/arm64
 
+      # ---------------------------------------------------------------
+      # 5. Docker/Buildx setup + registry login
+      # ---------------------------------------------------------------
       - name: Set up QEMU
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a  # v4.0.0
 
@@ -95,7 +174,9 @@ jobs:
           tag-semver: |
             {{version}}
 
-      # ---------- kubescape (server) image ----------
+      # ---------------------------------------------------------------
+      # 6. Build + push kubescape (server) image
+      # ---------------------------------------------------------------
       - name: Build and push kubescape - Docker/ECR
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
@@ -113,7 +194,9 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache/release
           cache-to: type=local,mode=max,dest=/tmp/.buildx-cache/release
 
-      # ---------- kubescape-cli image ----------
+      # ---------------------------------------------------------------
+      # 7. Build + push kubescape-cli image
+      # ---------------------------------------------------------------
       - name: Build and push kubescape-cli - Docker/ECR
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
