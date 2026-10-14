@@ -1,0 +1,132 @@
+---
+name: Publish Kubescape
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+env:
+  ALIAS: k9v9d5v2
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-2404-2core
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force > /dev/null
+          df -h
+
+      - name: Check Out Repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # ---------- Build binaries for BOTH architectures ----------
+      # The Dockerfiles do: COPY $TARGETPLATFORM/<binary> /usr/bin/<binary>
+      # TARGETPLATFORM is "linux/amd64" or "linux/arm64",
+      # so the context must have ./linux/amd64/... and ./linux/arm64/...
+      - name: Build kubescape + ksserver + downloader (amd64)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p linux/amd64
+          go build -o linux/amd64/kubescape       ./cmd/kubescape
+          go build -o linux/amd64/ksserver        ./cmd/ksserver
+          go build -o linux/amd64/downloader      ./cmd/downloader
+
+      - name: Build kubescape + ksserver + downloader (arm64)
+        env:
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          mkdir -p linux/arm64
+          go build -o linux/arm64/kubescape       ./cmd/kubescape
+          go build -o linux/arm64/ksserver        ./cmd/ksserver
+          go build -o linux/arm64/downloader      ./cmd/downloader
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a  # v4.0.0
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
+
+      - name: Cache Docker layers
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-kubescape-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-kubescape-
+
+      - name: Set up AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_DEV_ACCESS_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_DEV_SECRET_ID }}
+          aws-region: us-east-1
+
+      - name: Login to AWS ECR Public
+        run: |
+          aws ecr-public get-login-password --region us-east-1 \
+            | docker login --username AWS --password-stdin public.ecr.aws/${{ env.ALIAS }}
+
+      - name: Get version
+        id: get_version
+        uses: crazy-max/ghaction-docker-meta@c299e40c65443455700f0fdfc63efafe5b349051  # v5.10.0
+        with:
+          images: |
+            ${{ env.ALIAS }}/kubescape
+            ${{ env.ALIAS }}/kubescape-cli
+          tag-semver: |
+            {{version}}
+
+      # ---------- kubescape (server) image ----------
+      - name: Build and push kubescape - Docker/ECR
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: build/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          builder: ${{ steps.buildx.outputs.name }}
+          push: true
+          build-args: |
+            image_version=${{ steps.get_version.outputs.version }}
+            client=${{ steps.get_version.outputs.version }}
+          tags: |
+            public.ecr.aws/${{ env.ALIAS }}/kubescape:${{ steps.get_version.outputs.version }}
+            public.ecr.aws/${{ env.ALIAS }}/kubescape:latest
+          cache-from: type=local,src=/tmp/.buildx-cache/release
+          cache-to: type=local,mode=max,dest=/tmp/.buildx-cache/release
+
+      # ---------- kubescape-cli image ----------
+      - name: Build and push kubescape-cli - Docker/ECR
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: build/kubescape-cli.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          builder: ${{ steps.buildx.outputs.name }}
+          push: true
+          build-args: |
+            image_version=${{ steps.get_version.outputs.version }}
+            client=${{ steps.get_version.outputs.version }}
+          tags: |
+            public.ecr.aws/${{ env.ALIAS }}/kubescape-cli:${{ steps.get_version.outputs.version }}
+            public.ecr.aws/${{ env.ALIAS }}/kubescape-cli:latest
+          cache-from: type=local,src=/tmp/.buildx-cache/release
+          cache-to: type=local,mode=max,dest=/tmp/.buildx-cache/release
